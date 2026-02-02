@@ -1,0 +1,766 @@
+<%doc>
+GDD/CHU Analysis Page
+Calculate Growing Degree Days and Crop Heat Units for crop planning
+</%doc>
+
+<& /page/page_title.mas, title => "GDD/CHU Calculator" &>
+
+<div class="well well-sm">
+    <p>Calculate <strong>Growing Degree Days (GDD)</strong> and <strong>Crop Heat Units (CHU)</strong> for your locations. Select one or more years to compare growing seasons.</p>
+</div>
+
+<div class="panel panel-default">
+    <div class="panel-heading">
+        <h4>GDD/CHU Calculator</h4>
+    </div>
+    <div class="panel-body">
+        <div class="form-horizontal">
+            <div class="form-group">
+                <label class="col-sm-3 control-label">Select Location:</label>
+                <div class="col-sm-9">
+                    <select class="form-control" id="gdd_location_id">
+                        <option value="">Loading locations...</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="col-sm-3 control-label">Select Year(s):</label>
+                <div class="col-sm-9">
+                    <div id="year_selector" class="btn-group" data-toggle="buttons">
+                        <!-- Years populated dynamically -->
+                    </div>
+                    <p class="help-block">Click to select multiple years for comparison</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Display Options Panel -->
+        <div class="panel panel-default">
+            <div class="panel-heading">
+                <a data-toggle="collapse" href="#displayOptions">
+                    <span class="glyphicon glyphicon-cog"></span> Display Options
+                </a>
+            </div>
+            <div id="displayOptions" class="panel-collapse collapse in">
+                <div class="panel-body">
+                    <!-- Row 1: Crop and Chart Options -->
+                    <div class="row">
+                        <div class="col-md-5">
+                            <label>Crop / Base Temperature:</label>
+                            <select class="form-control" id="gdd_crop_select">
+                                <option value="">Loading crops...</option>
+                            </select>
+                            <input type="number" class="form-control" id="gdd_custom_base" placeholder="Custom base °C" style="margin-top:5px">
+                        </div>
+                        <div class="col-md-7">
+                            <label>Show on Chart:</label>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="chart_gdd" checked> GDD</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="chart_chu" checked> CHU</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="chart_precip"> Precipitation</label></div>
+                            <br>
+                            <label>Table Columns:</label>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_humidity"> Humidity</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_solar"> Solar</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_dewpoint"> Dew Point</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_pressure"> Pressure</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_uv"> UV</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_wind"> Wind</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_et"> ET</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_soiltemp"> Soil Temp</label></div>
+                            <div class="checkbox-inline"><label><input type="checkbox" id="show_soilmoisture"> Soil Moist</label></div>
+                        </div>
+                    </div>
+                    <hr>
+                    <!-- Row 2: Growing Season Dates -->
+                    <div id="season_config">
+                        <label>Growing Season Dates (per year):</label>
+                        <div id="season_inputs">
+                            <!-- Dynamically generated per-year date inputs -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <br>
+        <div class="text-center">
+            <button class="btn btn-default" id="gdd_config_station" type="button" style="margin-right: 10px;">
+                <span class="glyphicon glyphicon-cog"></span> Configure Station
+            </button>
+            <button class="btn btn-primary btn-lg" id="gdd_calculate" type="button">
+                <span class="glyphicon glyphicon-stats"></span> Calculate GDD/CHU
+            </button>
+        </div>
+    </div>
+</div>
+
+<div id="gdd_sync_status" class="alert alert-info" style="display:none"></div>
+
+<div id="gdd_results" style="display:none">
+    <div class="panel panel-success">
+        <div class="panel-heading">
+            <h4>Results 
+                <button class="btn btn-success btn-sm pull-right" id="gdd_export_excel">
+                    <span class="glyphicon glyphicon-download-alt"></span> Export to Excel
+                </button>
+            </h4>
+        </div>
+        <div class="panel-body">
+            <div class="row">
+                <div class="col-md-3">
+                    <div class="panel panel-info">
+                        <div class="panel-heading">Total GDD</div>
+                        <div class="panel-body text-center">
+                            <h2 id="result_total_gdd">0</h2>
+                            <p>Growing Degree Days</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="panel panel-warning">
+                        <div class="panel-heading">Total CHU</div>
+                        <div class="panel-body text-center">
+                            <h2 id="result_total_chu">0</h2>
+                            <p>Crop Heat Units</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="panel panel-primary">
+                        <div class="panel-heading">Total Precip</div>
+                        <div class="panel-body text-center">
+                            <h2 id="result_total_precip">0</h2>
+                            <p>mm Rainfall</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="panel panel-default">
+                        <div class="panel-heading">Days</div>
+                        <div class="panel-body text-center">
+                            <h2 id="result_days_count">0</h2>
+                            <p>Data Points</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <br>
+            <h4>Growing Season Charts</h4>
+            <div id="charts_container">
+                <!-- Single chart for overlay mode, or multiple charts for per-year mode -->
+                <div id="gdd_chart" style="height:400px;width:100%"></div>
+            </div>
+            <br>
+            <h4>Daily Data</h4>
+            <div class="table-responsive">
+                <table class="table table-striped table-condensed" id="gdd_data_table">
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Max &deg;C</th>
+                            <th>Min &deg;C</th>
+                            <th>GDD (day)</th>
+                            <th>GDD (cumul)</th>
+                            <th>CHU (day)</th>
+                            <th>CHU (cumul)</th>
+                            <th>Precip (mm)</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<script>
+var gddData = null; // Store for export
+
+// Reusable function to render the data table based on current checkbox state
+function renderTable(data) {
+    // Handle both single-year (daily_data) and multi-year (all_daily_data) formats
+    var dailyData = data.daily_data || data.all_daily_data;
+    if (!data || !dailyData) return;
+    
+    // Build table header dynamically
+    var thead = jQuery('#gdd_data_table thead tr');
+    thead.empty();
+    thead.append('<th>Date</th><th>Max °C</th><th>Min °C</th><th>GDD (day)</th><th>GDD (cumul)</th><th>CHU (day)</th><th>CHU (cumul)</th><th>Precip (mm)</th>');
+    
+    // Add optional columns based on checkboxes
+    if (jQuery('#show_humidity').is(':checked')) thead.append('<th>Humidity %</th>');
+    if (jQuery('#show_solar').is(':checked')) thead.append('<th>Solar MJ/m²</th>');
+    if (jQuery('#show_dewpoint').is(':checked')) thead.append('<th>Dew Pt °C</th>');
+    if (jQuery('#show_pressure').is(':checked')) thead.append('<th>Pressure hPa</th>');
+    if (jQuery('#show_uv').is(':checked')) thead.append('<th>UV Index</th>');
+    if (jQuery('#show_wind').is(':checked')) thead.append('<th>Wind km/h</th>');
+    if (jQuery('#show_et').is(':checked')) thead.append('<th>ET mm</th>');
+    if (jQuery('#show_soiltemp').is(':checked')) thead.append('<th>Soil °C</th>');
+    if (jQuery('#show_soilmoisture').is(':checked')) thead.append('<th>Soil %</th>');
+    
+    // Build table body
+    var tbody = jQuery('#gdd_data_table tbody');
+    tbody.empty();
+    jQuery.each(dailyData, function(i, day) {
+        var row = '<tr>' +
+            '<td>' + day.date + '</td>' +
+            '<td>' + day.temp_max + '</td>' +
+            '<td>' + day.temp_min + '</td>' +
+            '<td>' + day.gdd_day + '</td>' +
+            '<td>' + day.gdd_cumulative + '</td>' +
+            '<td>' + day.chu_day + '</td>' +
+            '<td>' + day.chu_cumulative + '</td>' +
+            '<td>' + day.precip_day + '</td>';
+        
+        // Add optional columns
+        if (jQuery('#show_humidity').is(':checked')) row += '<td>' + (day.humidity_mean || '-') + '</td>';
+        if (jQuery('#show_solar').is(':checked')) row += '<td>' + (day.solar_radiation || '-') + '</td>';
+        if (jQuery('#show_dewpoint').is(':checked')) row += '<td>' + (day.dew_point || '-') + '</td>';
+        if (jQuery('#show_pressure').is(':checked')) row += '<td>' + (day.pressure || '-') + '</td>';
+        if (jQuery('#show_uv').is(':checked')) row += '<td>' + (day.uv_index || '-') + '</td>';
+        if (jQuery('#show_wind').is(':checked')) row += '<td>' + (day.wind_speed_max || '-') + '</td>';
+        if (jQuery('#show_et').is(':checked')) row += '<td>' + (day.evapotranspiration || '-') + '</td>';
+        if (jQuery('#show_soiltemp').is(':checked')) row += '<td>' + (day.soil_temp || '-') + '</td>';
+        if (jQuery('#show_soilmoisture').is(':checked')) row += '<td>' + (day.soil_moisture || '-') + '</td>';
+        
+        row += '</tr>';
+        tbody.append(row);
+    });
+}
+
+jQuery(document).ready(function() {
+    
+    // Load locations directly
+    jQuery.ajax({
+        url: '/ajax/location/all',
+        dataType: 'json',
+        success: function(response) {
+            var select = jQuery('#gdd_location_id');
+            select.empty();
+            select.append('<option value="">-- Select Location --</option>');
+            if (response && response.data) {
+                jQuery.each(response.data, function(i, loc) {
+                    if (loc.properties && loc.properties.Name && loc.properties.Name !== '[Computation]') {
+                        select.append('<option value="' + loc.properties.Id + '">' + 
+                            loc.properties.Name + '</option>');
+                    }
+                });
+            }
+        },
+        error: function(xhr, status, error) {
+            jQuery('#gdd_location_id').html('<option value="">Error loading locations</option>');
+        }
+    });
+    
+    // Load crops
+    jQuery.ajax({
+        url: '/ajax/weather/crops',
+        dataType: 'json',
+        success: function(response) {
+            var select = jQuery('#gdd_crop_select');
+            select.empty();
+            select.append('<option value="">-- Select Crop --</option>');
+            if (response && response.crops) {
+                jQuery.each(response.crops, function(i, crop) {
+                    select.append('<option value="' + crop.id + '" data-base="' + crop.base_temp + '">' + 
+                        crop.crop_name + ' (Base: ' + crop.base_temp + '&deg;C)' + 
+                        (crop.use_chu ? ' [CHU]' : '') + '</option>');
+                });
+            }
+        }
+    });
+
+    // Initialize year selector (last 6 years)
+    var currentYear = new Date().getFullYear();
+    var yearSelector = jQuery('#year_selector');
+    for (var y = currentYear; y >= currentYear - 5; y--) {
+        var checked = (y === currentYear - 1) ? 'active' : ''; // Default to last year
+        yearSelector.append(
+            '<label class="btn btn-default ' + checked + '">' +
+            '<input type="checkbox" name="years" value="' + y + '" ' + (checked ? 'checked' : '') + '> ' + y +
+            '</label>'
+        );
+    }
+    
+    // Update season inputs when years change
+    function updateSeasonInputs() {
+        var selected = [];
+        jQuery('#year_selector input:checked').each(function() {
+            selected.push(parseInt(jQuery(this).val()));
+        });
+        selected.sort().reverse();
+        
+        var container = jQuery('#season_inputs');
+        container.empty();
+        
+        if (selected.length === 0) {
+            container.html('<p class="text-muted">Select at least one year above</p>');
+            return;
+        }
+        
+        jQuery.each(selected, function(i, year) {
+            var defaultStart = year + '-04-15';
+            var defaultEnd = year + '-09-30';
+            container.append(
+                '<div class="row" style="margin-bottom:5px">' +
+                '<div class="col-xs-2"><strong>' + year + ':</strong></div>' +
+                '<div class="col-xs-5">' +
+                '<input type="date" class="form-control input-sm season-start" data-year="' + year + '" value="' + defaultStart + '">' +
+                '</div>' +
+                '<div class="col-xs-5">' +
+                '<input type="date" class="form-control input-sm season-end" data-year="' + year + '" value="' + defaultEnd + '">' +
+                '</div>' +
+                '</div>'
+            );
+        });
+    }
+    
+    // Trigger season inputs update when years change
+    jQuery('#year_selector').on('change', 'input', function() {
+        jQuery(this).closest('label').toggleClass('active', this.checked);
+        updateSeasonInputs();
+    });
+    
+    // Initialize season inputs
+    updateSeasonInputs();
+    
+    // Re-render table when Display Options checkboxes change
+    jQuery('#displayOptions input[type="checkbox"]').change(function() {
+        if (gddData) {
+            // Re-render table with updated checkbox state
+            renderTable(gddData);
+        }
+    });
+    
+    // Export to Excel
+    jQuery('#gdd_export_excel').click(function() {
+        // Handle both single-year and multi-year data
+        var dataToExport = gddData ? (gddData.daily_data || gddData.all_daily_data) : null;
+        if (!dataToExport || dataToExport.length === 0) {
+            alert('No data to export. Please calculate GDD first.');
+            return;
+        }
+        
+        // Prepare data for Excel
+        var exportData = dataToExport.map(function(day) {
+            return {
+                'Date': day.date,
+                'Max Temp (°C)': day.temp_max,
+                'Min Temp (°C)': day.temp_min,
+                'GDD (daily)': day.gdd_day,
+                'GDD (cumulative)': day.gdd_cumulative,
+                'CHU (daily)': day.chu_day,
+                'CHU (cumulative)': day.chu_cumulative,
+                'Precip (mm)': day.precip_day,
+                'Humidity (%)': day.humidity_mean || '',
+                'Solar Radiation': day.solar_radiation || '',
+                'Dew Point (°C)': day.dew_point || '',
+                'Pressure (hPa)': day.pressure || '',
+                'UV Index': day.uv_index || '',
+                'Wind Speed (km/h)': day.wind_speed_max || '',
+                'ET (mm)': day.evapotranspiration || '',
+                'Soil Temp (°C)': day.soil_temp || '',
+                'Soil Moisture (%)': day.soil_moisture || '',
+                'Leaf Wetness': day.leaf_wetness || '',
+                'Source': day.source || ''
+            };
+        });
+        
+        // Add summary row
+        exportData.push({});
+        exportData.push({
+            'Date': 'TOTALS',
+            'Max Temp (&deg;C)': '',
+            'Min Temp (&deg;C)': '',
+            'GDD (daily)': '',
+            'GDD (cumulative)': gddData.total_gdd,
+            'CHU (daily)': '',
+            'CHU (cumulative)': gddData.total_chu,
+            'Precip (mm)': gddData.total_precip
+        });
+        
+        // Create workbook
+        var ws = XLSX.utils.json_to_sheet(exportData);
+        var wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'GDD_CHU_Data');
+        
+        // Generate filename
+        var locationName = jQuery('#gdd_location_id option:selected').text() || 'location';
+        var cropName = jQuery('#gdd_crop_select option:selected').text().split(' (')[0] || 'crop';
+        var filename = 'GDD_' + locationName + '_' + cropName + '_' + gddData.start_date + '.xlsx';
+        
+        // Download
+        XLSX.writeFile(wb, filename);
+    });
+    
+    // Calculate GDD (with automatic sync of missing data)
+    // Supports both single-year and multi-year modes
+    jQuery('#gdd_calculate').click(function() {
+        var location_id = jQuery('#gdd_location_id').val();
+        var crop_id = jQuery('#gdd_crop_select').val();
+        var base_temp = jQuery('#gdd_custom_base').val();
+        
+        if (!location_id) {
+            alert('Please select a location');
+            return;
+        }
+        
+        // Collect selected years and their season dates
+        var seasons = [];
+        jQuery('.season-start').each(function() {
+            var year = jQuery(this).data('year');
+            var start = jQuery(this).val();
+            var end = jQuery('.season-end[data-year="' + year + '"]').val();
+            if (start && end) {
+                seasons.push({ year: year, start: start, end: end });
+            }
+        });
+        
+        if (seasons.length === 0) {
+            alert('Please select at least one year');
+            return;
+        }
+        
+        // Show loading state
+        jQuery('#gdd_results').hide();
+        jQuery('#gdd_sync_status').removeClass('alert-success alert-danger').addClass('alert-info')
+            .html('<span class="glyphicon glyphicon-refresh spinning"></span> Checking database and fetching any missing weather data for ' + seasons.length + ' year(s)...').show();
+        jQuery('#gdd_calculate').prop('disabled', true).html('<span class="glyphicon glyphicon-refresh spinning"></span> Calculating...');
+        
+        jQuery.ajax({
+            url: '/ajax/weather/gdd',
+            data: {
+                location_id: location_id,
+                crop_id: crop_id,
+                base_temp: base_temp,
+                seasons: JSON.stringify(seasons)
+            },
+            success: function(response) {
+                // Reset button
+                jQuery('#gdd_calculate').prop('disabled', false).html('<span class="glyphicon glyphicon-stats"></span> Calculate GDD/CHU');
+                
+                if (response.error) {
+                    jQuery('#gdd_sync_status').removeClass('alert-info').addClass('alert-danger').html('Error: ' + response.error);
+                    return;
+                }
+                
+                // Show sync status
+                var syncMsg = '';
+                if (response.sync_info) {
+                    if (response.sync_info.synced > 0) {
+                        syncMsg = '<span class="glyphicon glyphicon-cloud-download"></span> Fetched ' + response.sync_info.synced + ' new days';
+                    } else {
+                        syncMsg = '<span class="glyphicon glyphicon-ok"></span> All data from cache';
+                    }
+                    syncMsg += ' (' + response.sync_info.existing + ' days already stored)';
+                }
+                jQuery('#gdd_sync_status').removeClass('alert-info alert-danger').addClass('alert-success').html(syncMsg);
+                
+                // Store data for export
+                gddData = response;
+                
+                if (response.multi_year && response.years) {
+                    // Multi-year mode - show per-year summary and overlay chart
+                    renderMultiYearResults(response);
+                } else {
+                    // Single-year mode (legacy fallback)
+                    jQuery('#result_total_gdd').text(response.total_gdd);
+                    jQuery('#result_total_chu').text(response.total_chu);
+                    jQuery('#result_total_precip').text(response.total_precip);
+                    jQuery('#result_days_count').text(response.days_count);
+                    renderTable(response);
+                    renderSingleYearChart(response);
+                }
+                
+                jQuery('#gdd_results').show();
+            },
+            error: function() {
+                jQuery('#gdd_calculate').prop('disabled', false).html('<span class="glyphicon glyphicon-stats"></span> Calculate GDD/CHU');
+                jQuery('#gdd_sync_status').removeClass('alert-info').addClass('alert-danger').html('Failed to calculate GDD');
+            }
+        });
+    });
+    
+    // Render multi-year results with per-year table and overlay chart
+    function renderMultiYearResults(data) {
+        // Update summary cards with averages
+        jQuery('#result_total_gdd').text(data.summary.avg_gdd + ' avg');
+        jQuery('#result_total_chu').text(data.summary.avg_chu + ' avg');
+        jQuery('#result_total_precip').text(data.summary.avg_precip + ' avg');
+        jQuery('#result_days_count').text(data.summary.total_days + ' (' + data.summary.years_count + ' yrs)');
+        
+        // Remove any previous year summary
+        jQuery('#year_summary').remove();
+        
+        // Build per-year summary table
+        var summaryHtml = '<h4>Per-Year Summary</h4><table class="table table-striped table-condensed">' +
+            '<thead><tr><th>Year</th><th>Days</th><th>Total GDD</th><th>Total CHU</th><th>Total Precip</th><th>Avg Temp</th></tr></thead><tbody>';
+        jQuery.each(data.years, function(i, yr) {
+            summaryHtml += '<tr>' +
+                '<td><strong>' + yr.year + '</strong></td>' +
+                '<td>' + yr.days_count + '</td>' +
+                '<td>' + yr.total_gdd + '</td>' +
+                '<td>' + yr.total_chu + '</td>' +
+                '<td>' + yr.total_precip + ' mm</td>' +
+                '<td>' + yr.avg_temp + '°C</td>' +
+                '</tr>';
+        });
+        summaryHtml += '</tbody></table>';
+        jQuery('#gdd_data_table').before('<div id="year_summary">' + summaryHtml + '</div>');
+        
+        // Get chart option states
+        var showGDD = jQuery('#chart_gdd').is(':checked');
+        var showCHU = jQuery('#chart_chu').is(':checked');
+        var showPrecip = jQuery('#chart_precip').is(':checked');
+        
+        // Create separate chart for each year
+        var container = jQuery('#charts_container');
+        container.empty();
+        
+        jQuery.each(data.years, function(i, yr) {
+            // Create chart div for this year
+            var chartId = 'chart_year_' + yr.year;
+            container.append('<div class="year-chart-wrapper" style="margin-bottom:20px; padding:15px; background:#f9f9f9; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1)">' +
+                '<h5 style="margin:0 0 10px 0; color:#2E7D32"><strong>' + yr.year + ' Growing Season</strong> (' + yr.start_date + ' to ' + yr.end_date + ')</h5>' +
+                '<div id="' + chartId + '" style="height:350px;width:100%"></div>' +
+                '</div>');
+            
+            var traces = [];
+            var dates = yr.daily_data.map(function(d) { return d.date; });
+            
+            // GDD trace (cumulative)
+            if (showGDD) {
+                traces.push({
+                    x: dates,
+                    y: yr.daily_data.map(function(d) { return parseFloat(d.gdd_cumulative); }),
+                    name: 'GDD',
+                    type: 'scatter',
+                    mode: 'lines',
+                    line: { color: '#2E7D32', width: 2 }
+                });
+            }
+            
+            // CHU trace (cumulative)
+            if (showCHU) {
+                traces.push({
+                    x: dates,
+                    y: yr.daily_data.map(function(d) { return parseFloat(d.chu_cumulative); }),
+                    name: 'CHU',
+                    type: 'scatter',
+                    mode: 'lines',
+                    line: { color: '#F57C00', width: 2 }
+                });
+            }
+            
+            // Precipitation bars (daily)
+            if (showPrecip) {
+                traces.push({
+                    x: dates,
+                    y: yr.daily_data.map(function(d) { return parseFloat(d.precip_day || 0); }),
+                    name: 'Precip (mm)',
+                    type: 'bar',
+                    yaxis: 'y2',
+                    marker: { color: '#1976D2', opacity: 0.6 }
+                });
+            }
+            
+            var layout = {
+                margin: { t: 10, b: 50, l: 60, r: 60 },
+                xaxis: { title: 'Date' },
+                yaxis: { title: 'Heat Units' },
+                legend: { orientation: 'h', y: 1.1 },
+                showlegend: true
+            };
+            
+            if (showPrecip) {
+                layout.yaxis2 = { title: 'Precip (mm)', overlaying: 'y', side: 'right' };
+            }
+            
+            Plotly.newPlot(chartId, traces, layout, { responsive: true });
+        });
+        
+        // Also render combined table
+        renderTable({ daily_data: data.all_daily_data });
+    }
+    
+    // Re-render charts when chart options change
+    jQuery('#chart_gdd, #chart_chu, #chart_precip').change(function() {
+        if (gddData && gddData.multi_year && gddData.years) {
+            renderMultiYearResults(gddData);
+        } else if (gddData && gddData.daily_data) {
+            renderSingleYearChart(gddData);
+        }
+    });
+    
+    // Render single-year chart (legacy)
+    function renderSingleYearChart(data) {
+        var dates = data.daily_data.map(function(d) { return d.date; });
+        var gdd_cumul = data.daily_data.map(function(d) { return parseFloat(d.gdd_cumulative); });
+        var chu_cumul = data.daily_data.map(function(d) { return parseFloat(d.chu_cumulative); });
+        var precip = data.daily_data.map(function(d) { return parseFloat(d.precip_day); });
+        
+        Plotly.newPlot('gdd_chart', [
+            { x: dates, y: gdd_cumul, name: 'GDD', type: 'scatter', mode: 'lines', line: {color: '#5cb85c', width: 3} },
+            { x: dates, y: chu_cumul, name: 'CHU', type: 'scatter', mode: 'lines', line: {color: '#f0ad4e', width: 3} },
+            { x: dates, y: precip, name: 'Precipitation (mm)', type: 'bar', yaxis: 'y2', marker: {color: '#5bc0de', opacity: 0.6} }
+        ], {
+            title: 'Cumulative GDD/CHU & Daily Precipitation',
+            xaxis: { title: 'Date' },
+            yaxis: { title: 'Heat Units' },
+            yaxis2: { title: 'Precipitation (mm)', overlaying: 'y', side: 'right' },
+            legend: { orientation: 'h', y: -0.2 }
+        });
+    }
+    
+    // Load location config when selected
+    jQuery('#gdd_location_id').change(function() {
+        var location_id = jQuery(this).val();
+        if (!location_id) return;
+        
+        // Load station config
+        jQuery.ajax({
+            url: '/ajax/weather/station_config/get',
+            data: { location_id: location_id },
+            success: function(response) {
+                if (response.config) {
+                    var type = response.config.weather_station_type || 'Open-Meteo';
+                    jQuery('#station_type').val(type).trigger('change');
+                    
+                    if (type === 'Davis') {
+                        jQuery('#davis_api_key').val(response.config.davis_api_key);
+                        jQuery('#davis_api_secret').val(response.config.davis_api_secret);
+                        jQuery('#davis_station_id').val(response.config.davis_station_id);
+                    } else if (type === 'Ecowitt') {
+                        jQuery('#ecowitt_mac').val(response.config.ecowitt_mac_address);
+                        jQuery('#ecowitt_app_key').val(response.config.ecowitt_app_key);
+                    }
+                }
+            }
+        });
+    });
+
+    // Configure Station Button
+    jQuery('#gdd_config_station').click(function() {
+        if (!jQuery('#gdd_location_id').val()) {
+            alert('Please select a location first');
+            return;
+        }
+        jQuery('#station_config_modal').modal('show');
+    });
+    
+    // Station Type Change
+    jQuery('#station_type').change(function() {
+        var type = jQuery(this).val();
+        jQuery('#davis_fields').hide();
+        jQuery('#ecowitt_fields').hide();
+        
+        if (type === 'Davis') {
+            jQuery('#davis_fields').show();
+        } else if (type === 'Ecowitt') {
+            jQuery('#ecowitt_fields').show();
+        }
+    });
+    
+    // Save Station Config
+    jQuery('#save_station_config').click(function() {
+        var location_id = jQuery('#gdd_location_id').val();
+        var type = jQuery('#station_type').val();
+        
+        jQuery.ajax({
+            url: '/ajax/weather/station_config/save',
+            data: {
+                location_id: location_id,
+                station_type: type,
+                davis_api_key: jQuery('#davis_api_key').val(),
+                davis_api_secret: jQuery('#davis_api_secret').val(),
+                davis_station_id: jQuery('#davis_station_id').val(),
+                ecowitt_mac: jQuery('#ecowitt_mac').val(),
+                ecowitt_app_key: jQuery('#ecowitt_app_key').val()
+            },
+            success: function(response) {
+                if (response.success) {
+                    alert('Configuration saved!');
+                    jQuery('#station_config_modal').modal('hide');
+                } else {
+                    alert('Error saving: ' + (response.error || 'Unknown error'));
+                }
+            },
+            error: function() {
+                alert('Error saving configuration');
+            }
+        });
+    });
+
+});
+</script>
+
+<!-- Station Config Modal -->
+<div class="modal fade" id="station_config_modal" role="dialog">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <button type="button" class="close" data-dismiss="modal">&times;</button>
+                <h4 class="modal-title">Weather Station Configuration</h4>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Station Type:</label>
+                    <select class="form-control" id="station_type">
+                        <option value="Open-Meteo">Open-Meteo (Default/Virtual)</option>
+                        <option value="Davis">Davis WeatherLink</option>
+                        <option value="Ecowitt">Ecowitt</option>
+                    </select>
+                </div>
+                
+                <div id="davis_fields" style="display:none">
+                    <div class="form-group">
+                        <label>API Key:</label>
+                        <input type="text" class="form-control" id="davis_api_key" placeholder="Enter API Key">
+                    </div>
+                    <div class="form-group">
+                        <label>API Secret:</label>
+                        <input type="text" class="form-control" id="davis_api_secret" placeholder="Enter API Secret">
+                    </div>
+                    <div class="form-group">
+                        <label>Station ID:</label>
+                        <input type="text" class="form-control" id="davis_station_id" placeholder="Enter Station ID">
+                    </div>
+                </div>
+
+                <div id="ecowitt_fields" style="display:none">
+                    <div class="form-group">
+                        <label>MAC Address:</label>
+                        <input type="text" class="form-control" id="ecowitt_mac" placeholder="Enter MAC Address">
+                    </div>
+                    <div class="form-group">
+                        <label>Application Key:</label>
+                        <input type="text" class="form-control" id="ecowitt_app_key" placeholder="Enter App Key">
+                    </div>
+                </div>
+                <div class="alert alert-info">
+                   <small>Note: Enter the required credentials to allow importing data from your private weather station.</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-default" data-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" id="save_station_config">Save Configuration</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.spinning {
+    animation: spin 1s linear infinite;
+}
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+.input-group.date .input-group-addon {
+    cursor: pointer;
+}
+</style>
