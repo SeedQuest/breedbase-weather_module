@@ -93,6 +93,21 @@ ecowitt_api_key YOUR_API_KEY
 ecowitt_mac     YOUR_DEVICE_MAC
 ```
 
+## Optional Patches
+
+The `patches/` directory contains fixes for BreedBase core modules:
+
+| File | Fix |
+|------|-----|
+| `Dataset.pm` | Fixes sp_dataset_id type validation error |
+| `List.pm` | Adds list_id validation in add_bulk |
+
+Mount in docker-compose.yml if needed:
+```yaml
+- /path/to/patches/Dataset.pm:/home/production/cxgn/sgn/lib/CXGN/Dataset.pm:ro
+- /path/to/patches/List.pm:/home/production/cxgn/sgn/lib/CXGN/List.pm:ro
+```
+
 ## License
 
 MIT License - Free for commercial and non-commercial use.
