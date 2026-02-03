@@ -212,6 +212,92 @@ sub _do_gdd_calculation {
 }
 
 # ============================================================================
+# GDD FOR PERIOD (Phenology Button)
+# ============================================================================
+# Calculates GDD/CHU between two dates for a location
+# Used by "Calculate GDD" button when recording phenology observations
+
+sub gdd_for_period : Path('/ajax/weather/gdd_for_period') Args(0) ActionClass('REST') { }
+sub gdd_for_period_GET { shift->_do_gdd_for_period(@_); }
+sub gdd_for_period_POST { shift->_do_gdd_for_period(@_); }
+
+sub _do_gdd_for_period {
+    my ($self, $c) = @_;
+    
+    my $location_id = $c->req->param('location_id');
+    my $start_date = $c->req->param('start_date');  # Planting date
+    my $end_date = $c->req->param('end_date');      # Observation date
+    my $base_temp = $c->req->param('base_temp') || 10;
+    my $max_temp = $c->req->param('max_temp') || 30;
+    
+    unless ($location_id && $start_date && $end_date) {
+        $c->stash->{rest} = { 
+            error => "Missing required parameters: location_id, start_date, end_date" 
+        };
+        return;
+    }
+    
+    try {
+        my ($lat, $lon) = $self->_get_location_coords($c, $location_id);
+        
+        # Get cached weather data or fetch from API
+        my $weather_data = $self->_get_cached_weather($c, $location_id, $start_date, $end_date);
+        
+        if (!$weather_data || scalar(@$weather_data) == 0) {
+            # Fetch from Open-Meteo
+            my $api_data = $self->_fetch_openmeteo_data($lat, $lon, $start_date, $end_date);
+            $weather_data = $self->_parse_api_response($api_data, 'openmeteo');
+            
+            if ($weather_data && scalar(@$weather_data) > 0) {
+                $self->_cache_weather_data($c, $location_id, $weather_data, 'openmeteo');
+            }
+        }
+        
+        # Calculate GDD and CHU
+        my ($total_gdd, $total_chu) = (0, 0);
+        my $days_count = 0;
+        
+        foreach my $day (@{$weather_data || []}) {
+            my $tmax = $day->{tmax} // 20;
+            my $tmin = $day->{tmin} // 10;
+            
+            # Cap temperatures for GDD calculation
+            $tmax = $max_temp if $tmax > $max_temp;
+            $tmin = $base_temp if $tmin < $base_temp;
+            
+            my $tavg = ($tmax + $tmin) / 2;
+            my $gdd = $tavg > $base_temp ? $tavg - $base_temp : 0;
+            $total_gdd += $gdd;
+            
+            # CHU calculation (Ontario method)
+            my $chu_max = $day->{tmax} > 10 ? 3.33 * ($day->{tmax} - 10) - 0.084 * (($day->{tmax} - 10) ** 2) : 0;
+            my $chu_min = $day->{tmin} > 4.4 ? 1.8 * ($day->{tmin} - 4.4) : 0;
+            my $chu_day = ($chu_max + $chu_min) / 2;
+            $chu_day = 0 if $chu_day < 0;
+            $total_chu += $chu_day;
+            
+            $days_count++;
+        }
+        
+        $c->stash->{rest} = {
+            success => 1,
+            location_id => $location_id,
+            start_date => $start_date,
+            end_date => $end_date,
+            days_count => $days_count,
+            gdd => sprintf("%.1f", $total_gdd),
+            chu => sprintf("%.1f", $total_chu),
+            base_temp => $base_temp,
+            max_temp => $max_temp,
+            location => { lat => $lat, lon => $lon },
+        };
+        
+    } catch {
+        $c->stash->{rest} = { error => "Failed to calculate GDD for period: $_" };
+    };
+}
+
+# ============================================================================
 # DATABASE CACHING
 # ============================================================================
 
