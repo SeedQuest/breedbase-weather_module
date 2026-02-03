@@ -100,9 +100,14 @@ Calculate Growing Degree Days and Crop Heat Units for crop planning
     <div class="panel panel-success">
         <div class="panel-heading">
             <h4>Results 
-                <button class="btn btn-success btn-sm pull-right" id="gdd_export_excel">
-                    <span class="glyphicon glyphicon-download-alt"></span> Export to Excel
-                </button>
+                <div class="pull-right">
+                    <button class="btn btn-success btn-sm" id="gdd_export_excel">
+                        <span class="glyphicon glyphicon-download-alt"></span> Export to Excel
+                    </button>
+                    <button class="btn btn-primary btn-sm" id="maturity_calculator_btn" style="margin-left:5px">
+                        <span class="glyphicon glyphicon-grain"></span> Maturity Calculator
+                    </button>
+                </div>
             </h4>
         </div>
         <div class="panel-body">
@@ -751,6 +756,260 @@ jQuery(document).ready(function() {
         </div>
     </div>
 </div>
+
+<!-- Maturity Calculator Modal -->
+<div class="modal fade" id="maturity_calculator_modal" role="dialog">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-primary" style="color:white">
+                <button type="button" class="close" data-dismiss="modal" style="color:white">&times;</button>
+                <h4 class="modal-title"><span class="glyphicon glyphicon-grain"></span> Maturity Calculator - Create Phenotypes</h4>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info">
+                    <strong>GDD:</strong> <span id="mc_gdd_value">0</span> | 
+                    <strong>CHU:</strong> <span id="mc_chu_value">0</span> | 
+                    <strong>Period:</strong> <span id="mc_period_display">-</span>
+                </div>
+                
+                <div class="form-group">
+                    <label>Search Trial:</label>
+                    <input type="text" class="form-control" id="mc_trial_search" placeholder="Type to search trials...">
+                </div>
+                
+                <div id="mc_trial_results" style="max-height:150px; overflow-y:auto; border:1px solid #ddd; padding:5px; margin-bottom:15px; display:none"></div>
+                
+                <div id="mc_accession_section" style="display:none">
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="mc_select_all"> Select All Accessions
+                        </label>
+                        <span class="badge" id="mc_accession_count" style="margin-left:10px">0</span>
+                    </div>
+                    
+                    <div id="mc_accession_list" style="max-height:250px; overflow-y:auto; border:1px solid #ddd; padding:10px">
+                        <!-- Accession checkboxes -->
+                    </div>
+                </div>
+                
+                <div id="mc_loading" style="display:none; text-align:center">
+                    <span class="glyphicon glyphicon-refresh spinning"></span> Loading...
+                </div>
+            </div>
+            <div class="modal-footer">
+                <span id="mc_status" class="text-success pull-left"></span>
+                <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="mc_create_phenotypes" disabled>
+                    <span class="glyphicon glyphicon-plus"></span> Create GDD/CHU Phenotypes
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Maturity Calculator JavaScript
+jQuery(document).ready(function() {
+    var mcSelectedTrial = null;
+    var mcAccessions = [];
+    
+    // Open Maturity Calculator modal
+    jQuery('#maturity_calculator_btn').click(function() {
+        if (!gddData) {
+            alert('Please calculate GDD/CHU first');
+            return;
+        }
+        
+        // Display current GDD/CHU values
+        jQuery('#mc_gdd_value').text(gddData.total_gdd || gddData.summary?.avg_gdd || 0);
+        jQuery('#mc_chu_value').text(gddData.total_chu || gddData.summary?.avg_chu || 0);
+        
+        var period = '';
+        if (gddData.years && gddData.years.length > 0) {
+            period = gddData.years[0].start_date + ' to ' + gddData.years[0].end_date;
+        }
+        jQuery('#mc_period_display').text(period);
+        
+        // Reset state
+        jQuery('#mc_trial_search').val('');
+        jQuery('#mc_trial_results').hide().empty();
+        jQuery('#mc_accession_section').hide();
+        jQuery('#mc_accession_list').empty();
+        jQuery('#mc_create_phenotypes').prop('disabled', true);
+        jQuery('#mc_status').text('');
+        mcSelectedTrial = null;
+        mcAccessions = [];
+        
+        jQuery('#maturity_calculator_modal').modal('show');
+    });
+    
+    // Trial search
+    var searchTimeout;
+    jQuery('#mc_trial_search').on('input', function() {
+        var query = jQuery(this).val().trim();
+        clearTimeout(searchTimeout);
+        
+        if (query.length < 2) {
+            jQuery('#mc_trial_results').hide();
+            return;
+        }
+        
+        searchTimeout = setTimeout(function() {
+            jQuery('#mc_loading').show();
+            
+            jQuery.ajax({
+                url: '/ajax/trial/search',
+                data: { term: query },
+                success: function(response) {
+                    jQuery('#mc_loading').hide();
+                    var results = jQuery('#mc_trial_results');
+                    results.empty();
+                    
+                    if (response && response.data && response.data.length > 0) {
+                        jQuery.each(response.data, function(i, trial) {
+                            results.append(
+                                '<div class="mc-trial-item" data-id="' + trial.trial_id + '" data-name="' + trial.trial_name + '" style="padding:8px; cursor:pointer; border-bottom:1px solid #eee">' +
+                                '<strong>' + trial.trial_name + '</strong>' +
+                                (trial.location_name ? ' <span class="text-muted">(' + trial.location_name + ')</span>' : '') +
+                                '</div>'
+                            );
+                        });
+                        results.show();
+                    } else {
+                        results.html('<p class="text-muted" style="padding:10px">No trials found</p>').show();
+                    }
+                },
+                error: function() {
+                    jQuery('#mc_loading').hide();
+                    jQuery('#mc_trial_results').html('<p class="text-danger" style="padding:10px">Error searching trials</p>').show();
+                }
+            });
+        }, 300);
+    });
+    
+    // Select trial
+    jQuery('#mc_trial_results').on('click', '.mc-trial-item', function() {
+        mcSelectedTrial = {
+            id: jQuery(this).data('id'),
+            name: jQuery(this).data('name')
+        };
+        
+        jQuery('#mc_trial_search').val(mcSelectedTrial.name);
+        jQuery('#mc_trial_results').hide();
+        
+        // Load accessions for this trial
+        jQuery('#mc_loading').show();
+        jQuery('#mc_accession_section').hide();
+        
+        jQuery.ajax({
+            url: '/ajax/trial/' + mcSelectedTrial.id + '/accessions',
+            success: function(response) {
+                jQuery('#mc_loading').hide();
+                mcAccessions = response.data || [];
+                
+                var list = jQuery('#mc_accession_list');
+                list.empty();
+                
+                if (mcAccessions.length > 0) {
+                    jQuery('#mc_accession_count').text(mcAccessions.length + ' accessions');
+                    
+                    jQuery.each(mcAccessions, function(i, acc) {
+                        list.append(
+                            '<div class="checkbox" style="margin:3px 0">' +
+                            '<label><input type="checkbox" class="mc-accession-cb" value="' + acc.stock_id + '" data-name="' + acc.accession_name + '"> ' +
+                            acc.accession_name + '</label>' +
+                            '</div>'
+                        );
+                    });
+                    
+                    jQuery('#mc_accession_section').show();
+                } else {
+                    list.html('<p class="text-muted">No accessions in this trial</p>');
+                    jQuery('#mc_accession_section').show();
+                }
+            },
+            error: function() {
+                jQuery('#mc_loading').hide();
+                jQuery('#mc_accession_list').html('<p class="text-danger">Error loading accessions</p>');
+                jQuery('#mc_accession_section').show();
+            }
+        });
+    });
+    
+    // Select All checkbox
+    jQuery('#mc_select_all').change(function() {
+        jQuery('.mc-accession-cb').prop('checked', jQuery(this).is(':checked'));
+        updateCreateButton();
+    });
+    
+    // Individual checkbox change
+    jQuery('#mc_accession_list').on('change', '.mc-accession-cb', function() {
+        updateCreateButton();
+    });
+    
+    function updateCreateButton() {
+        var selectedCount = jQuery('.mc-accession-cb:checked').length;
+        jQuery('#mc_create_phenotypes').prop('disabled', selectedCount === 0);
+        jQuery('#mc_create_phenotypes').html(
+            '<span class="glyphicon glyphicon-plus"></span> Create GDD/CHU for ' + selectedCount + ' Accession(s)'
+        );
+    }
+    
+    // Create Phenotypes
+    jQuery('#mc_create_phenotypes').click(function() {
+        var selectedIds = [];
+        jQuery('.mc-accession-cb:checked').each(function() {
+            selectedIds.push(jQuery(this).val());
+        });
+        
+        if (selectedIds.length === 0) {
+            alert('Please select at least one accession');
+            return;
+        }
+        
+        jQuery('#mc_create_phenotypes').prop('disabled', true).html(
+            '<span class="glyphicon glyphicon-refresh spinning"></span> Creating...'
+        );
+        
+        jQuery.ajax({
+            url: '/ajax/phenotype/store_gdd_batch',
+            type: 'POST',
+            data: {
+                trial_id: mcSelectedTrial.id,
+                accession_ids: JSON.stringify(selectedIds),
+                gdd: gddData.total_gdd || gddData.summary?.avg_gdd || 0,
+                chu: gddData.total_chu || gddData.summary?.avg_chu || 0,
+                start_date: gddData.years ? gddData.years[0].start_date : '',
+                end_date: gddData.years ? gddData.years[0].end_date : '',
+                location_id: jQuery('#gdd_location_id').val()
+            },
+            success: function(response) {
+                if (response.success) {
+                    jQuery('#mc_status').text('✓ Created ' + response.created + ' phenotypes');
+                    jQuery('#mc_create_phenotypes').html(
+                        '<span class="glyphicon glyphicon-ok"></span> Done!'
+                    ).removeClass('btn-primary').addClass('btn-success');
+                    
+                    setTimeout(function() {
+                        jQuery('#maturity_calculator_modal').modal('hide');
+                    }, 1500);
+                } else {
+                    jQuery('#mc_status').html('<span class="text-danger">Error: ' + (response.error || 'Unknown') + '</span>');
+                    jQuery('#mc_create_phenotypes').prop('disabled', false).html(
+                        '<span class="glyphicon glyphicon-plus"></span> Create GDD/CHU Phenotypes'
+                    );
+                }
+            },
+            error: function() {
+                jQuery('#mc_status').html('<span class="text-danger">Failed to create phenotypes</span>');
+                jQuery('#mc_create_phenotypes').prop('disabled', false).html(
+                    '<span class="glyphicon glyphicon-plus"></span> Create GDD/CHU Phenotypes'
+                );
+            }
+        });
+    });
+});
+</script>
 
 <style>
 .spinning {

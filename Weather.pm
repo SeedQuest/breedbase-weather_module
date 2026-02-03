@@ -718,4 +718,100 @@ sub _timestamp_to_date {
     return sprintf("%04d-%02d-%02d", $t[5] + 1900, $t[4] + 1, $t[3]);
 }
 
+# ============================================================================
+# STORE GDD/CHU PHENOTYPES (Maturity Calculator)
+# ============================================================================
+
+sub store_gdd_phenotypes : Path('/ajax/phenotype/store_gdd_batch') Args(0) ActionClass('REST') { }
+sub store_gdd_phenotypes_POST {
+    my ($self, $c) = @_;
+    
+    my $trial_id = $c->req->param('trial_id');
+    my $accession_ids_json = $c->req->param('accession_ids');
+    my $gdd_value = $c->req->param('gdd');
+    my $chu_value = $c->req->param('chu');
+    my $start_date = $c->req->param('start_date');
+    my $end_date = $c->req->param('end_date');
+    my $location_id = $c->req->param('location_id');
+    
+    unless ($trial_id && $accession_ids_json && $gdd_value && $chu_value) {
+        $c->stash->{rest} = { error => "Missing required parameters" };
+        return;
+    }
+    
+    try {
+        my $accession_ids = decode_json($accession_ids_json);
+        my $dbh = $c->dbc->dbh;
+        
+        # Get GDD and CHU trait IDs
+        my $sth_trait = $dbh->prepare(q{
+            SELECT cvterm_id, name FROM cvterm 
+            WHERE name IN ('Growing Degree Days', 'Crop Heat Units')
+            AND cv_id = (SELECT cv_id FROM cv WHERE name = 'maize_trait')
+        });
+        $sth_trait->execute();
+        
+        my %trait_ids;
+        while (my $row = $sth_trait->fetchrow_hashref) {
+            $trait_ids{$row->{name}} = $row->{cvterm_id};
+        }
+        
+        my $gdd_trait_id = $trait_ids{'Growing Degree Days'};
+        my $chu_trait_id = $trait_ids{'Crop Heat Units'};
+        
+        unless ($gdd_trait_id && $chu_trait_id) {
+            $c->stash->{rest} = { error => "GDD/CHU traits not found in maize ontology" };
+            return;
+        }
+        
+        # Get experiment/plot IDs for the accessions in this trial
+        my $placeholders = join(',', ('?') x scalar(@$accession_ids));
+        my $sth_plots = $dbh->prepare(qq{
+            SELECT s.stock_id, nde.nd_experiment_id
+            FROM stock s
+            JOIN nd_experiment_stock nes ON s.stock_id = nes.stock_id
+            JOIN nd_experiment nde ON nes.nd_experiment_id = nde.nd_experiment_id
+            JOIN nd_experiment_project ndep ON nde.nd_experiment_id = ndep.nd_experiment_id
+            WHERE ndep.project_id = ?
+            AND s.stock_id IN ($placeholders)
+        });
+        $sth_plots->execute($trial_id, @$accession_ids);
+        
+        my %stock_experiments;
+        while (my $row = $sth_plots->fetchrow_hashref) {
+            $stock_experiments{$row->{stock_id}} = $row->{nd_experiment_id};
+        }
+        
+        # Insert phenotypes
+        my $sth_insert = $dbh->prepare(q{
+            INSERT INTO phenotype (observable_id, value, nd_experiment_id, cvalue_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+        });
+        
+        my $created = 0;
+        foreach my $stock_id (@$accession_ids) {
+            my $exp_id = $stock_experiments{$stock_id};
+            next unless $exp_id;
+            
+            # Insert GDD phenotype
+            $sth_insert->execute($gdd_trait_id, $gdd_value, $exp_id, undef);
+            $created++ if $sth_insert->rows > 0;
+            
+            # Insert CHU phenotype
+            $sth_insert->execute($chu_trait_id, $chu_value, $exp_id, undef);
+            $created++ if $sth_insert->rows > 0;
+        }
+        
+        $c->stash->{rest} = {
+            success => 1,
+            created => $created,
+            message => "Created $created GDD/CHU phenotypes"
+        };
+        
+    } catch {
+        $c->stash->{rest} = { error => "Failed to store phenotypes: $_" };
+    };
+}
+
 1;
