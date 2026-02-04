@@ -38,6 +38,67 @@ sub get_crops_GET {
 }
 
 # ============================================================================
+# MATURITY TRAITS DISCOVERY ENDPOINT (for portable deployment)
+# ============================================================================
+
+sub get_maturity_traits : Path('/ajax/weather/maturity_traits') Args(0) ActionClass('REST') { }
+sub get_maturity_traits_GET {
+    my ($self, $c) = @_;
+    
+    my $crop = $c->req->param('crop') || 'maize_trait';
+    
+    my $dbh = $c->dbc->dbh();
+    
+    # Search for maturity-related traits in the specified ontology
+    my $sth = $dbh->prepare(q{
+        SELECT c.cvterm_id, c.name, cv.name as ontology
+        FROM cvterm c
+        JOIN cv ON c.cv_id = cv.cv_id
+        WHERE cv.name = ?
+        AND (
+            c.name ILIKE '%maturity time%'
+            OR c.name ILIKE '%days to maturity%'
+            OR c.name ILIKE '%maturity group%'
+        )
+        ORDER BY c.name
+    });
+    $sth->execute($crop);
+    
+    my @traits;
+    while (my $row = $sth->fetchrow_hashref) {
+        my $name = $row->{name};
+        my $format = 'unknown';
+        
+        # Detect format from trait name
+        if ($name =~ /-(?: |)day(?:s)?$/i || $name =~ /time - day/i) {
+            $format = 'day';
+        } elsif ($name =~ /yyyymmdd/i || $name =~ /date/i) {
+            $format = 'date';
+        }
+        
+        push @traits, {
+            id       => $row->{cvterm_id},
+            name     => $name,
+            ontology => $row->{ontology},
+            format   => $format,
+        };
+    }
+    
+    # Sort: supported formats first (day, date), then unknown
+    @traits = sort { 
+        ($a->{format} eq 'unknown' ? 1 : 0) <=> ($b->{format} eq 'unknown' ? 1 : 0) 
+        || $a->{name} cmp $b->{name}
+    } @traits;
+    
+    $c->stash->{rest} = { 
+        success => 1,
+        crop    => $crop,
+        traits  => \@traits,
+        count   => scalar(@traits)
+    };
+}
+
+# ============================================================================
 # GDD CALCULATION ENDPOINT
 # ============================================================================
 
@@ -54,7 +115,20 @@ sub _do_gdd_calculation {
     my $data_source = $c->req->param('data_source') || 'openmeteo';
     
     try {
-        my $seasons = decode_json($seasons_json);
+        my $seasons;
+        if ($seasons_json) {
+            $seasons = decode_json($seasons_json);
+        } else {
+            # Fallback: construct season from start_date/end_date params
+            my $start = $c->req->param('start_date');
+            my $end = $c->req->param('end_date');
+            if ($start && $end) {
+                my ($year) = $start =~ /^(\d{4})/;
+                $seasons = [{ year => $year, start_date => $start, end_date => $end }];
+            } else {
+                die "Missing required parameters: seasons or start_date/end_date";
+            }
+        }
         my @results;
         my ($lat, $lon) = $self->_get_location_coords($c, $location_id);
         my $cache_stats = { from_cache => 0, from_api => 0 };
@@ -719,6 +793,385 @@ sub _timestamp_to_date {
 }
 
 # ============================================================================
+# GET TRIAL LOCATION ID
+# ============================================================================
+
+sub get_trial_location_id : Path('/ajax/trial') Args(2) ActionClass('REST') {
+    my ($self, $c, $trial_id, $action) = @_;
+    return unless $action eq 'location_id';
+}
+
+sub get_trial_location_id_GET {
+    my ($self, $c, $trial_id, $action) = @_;
+    
+    my $dbh = $c->dbc->dbh;
+    
+    # Get location_id from projectprop
+    my $sth = $dbh->prepare(q{
+        SELECT pp.value::integer as location_id, g.description as location_name
+        FROM projectprop pp
+        JOIN cvterm cv ON pp.type_id = cv.cvterm_id
+        LEFT JOIN nd_geolocation g ON pp.value::integer = g.nd_geolocation_id
+        WHERE pp.project_id = ? AND cv.name = 'project location'
+        LIMIT 1
+    });
+    $sth->execute($trial_id);
+    
+    my $row = $sth->fetchrow_hashref;
+    
+    $c->stash->{rest} = {
+        location_id => $row ? $row->{location_id} : undef,
+        location_name => $row ? $row->{location_name} : undef,
+        trial_id => $trial_id
+    };
+}
+
+# ============================================================================
+# GET TRIAL PHENOLOGY DATA (Per-Accession Dates)
+# ============================================================================
+
+sub get_trial_phenology : Path('/ajax/trial') Args(2) ActionClass('REST') {
+    my ($self, $c, $trial_id, $action) = @_;
+    return unless $action eq 'phenology';
+}
+
+sub get_trial_phenology_GET {
+    my ($self, $c, $trial_id, $action) = @_;
+    
+    my $dbh = $c->dbc->dbh;
+    
+    # Crop-specific trait IDs
+    my %crop_traits = (
+        'maize_trait' => {  # Maize
+            emergence => 97939,
+            flowering => [81054, 81052],  # Silking time - day, Anthesis silking interval
+            maturity  => [80767, 81183, 97771],  # Maturity time - day variants
+            gdd => 97927, chu => 97929, fao => 97931
+        },
+        'CO_336' => {  # Soybean
+            emergence => 97940,
+            flowering => [81093, 81215],  # First flower, Flowering time
+            maturity  => [81098, 81084],  # Maturity time, R8
+            gdd => 97932, chu => 97933, fao => 97934
+        },
+        'CO_359' => {  # Sunflower
+            emergence => [81733, 81669],  # Cotyledon, Seedling
+            flowering => 81609,
+            maturity  => [81736, 81681],
+            gdd => 97935, chu => 97936, fao => 97937
+        },
+        'CO_358' => {  # Cotton
+            emergence => 82920,  # Days to 50% emergence
+            flowering => 82733,  # Days to 50% flowering
+            maturity  => 82577,  # Days to 50% boll opening
+            gdd => 97942, chu => 97943, fao => 97944
+        }
+    );
+    
+    # Get trial dates
+    my $sth_trial = $dbh->prepare(q{
+        SELECT 
+            (SELECT value FROM projectprop WHERE project_id = p.project_id AND type_id = (SELECT cvterm_id FROM cvterm WHERE name = 'project_planting_date')) as planting_date,
+            (SELECT value FROM projectprop WHERE project_id = p.project_id AND type_id = (SELECT cvterm_id FROM cvterm WHERE name = 'project_harvest_date')) as harvest_date,
+            (SELECT value::integer FROM projectprop WHERE project_id = p.project_id AND type_id = (SELECT cvterm_id FROM cvterm WHERE name = 'project location')) as location_id
+        FROM project p
+        WHERE p.project_id = ?
+    });
+    $sth_trial->execute($trial_id);
+    my $trial_row = $sth_trial->fetchrow_hashref;
+    
+    # Parse JSON date format: {"2025-04-15T00:00:00",...}
+    my $planting = $trial_row->{planting_date} || '';
+    my $harvest = $trial_row->{harvest_date} || '';
+    my $location_id = $trial_row->{location_id};
+    $planting =~ s/.*?(\d{4}-\d{2}-\d{2}).*/$1/ if $planting;
+    $harvest =~ s/.*?(\d{4}-\d{2}-\d{2}).*/$1/ if $harvest;
+    
+    # Detect crop type from trial
+    my $sth_crop = $dbh->prepare(q{
+        SELECT DISTINCT cv.name as cv_name
+        FROM project p
+        JOIN nd_experiment_project nep ON p.project_id = nep.project_id
+        JOIN nd_experiment_stock nes ON nep.nd_experiment_id = nes.nd_experiment_id
+        JOIN stock st ON nes.stock_id = st.stock_id  
+        JOIN cvterm c ON st.type_id = c.cvterm_id
+        JOIN stock_cvterm sc ON st.stock_id = sc.stock_id
+        JOIN cvterm trait ON sc.cvterm_id = trait.cvterm_id
+        JOIN cv ON trait.cv_id = cv.cv_id
+        WHERE p.project_id = ? AND cv.name IN ('maize_trait', 'CO_336', 'CO_359', 'CO_358')
+        LIMIT 1
+    });
+    $sth_crop->execute($trial_id);
+    my ($detected_cv) = $sth_crop->fetchrow_array;
+    $detected_cv ||= 'maize_trait';  # Default to maize
+    
+    my $traits = $crop_traits{$detected_cv};
+    
+    # Build trait ID list for lookup
+    my @trait_ids;
+    foreach my $type (qw(emergence flowering maturity)) {
+        my $t = $traits->{$type};
+        if (ref($t) eq 'ARRAY') {
+            push @trait_ids, @$t;
+        } elsif ($t) {
+            push @trait_ids, $t;
+        }
+    }
+    my $trait_list = join(',', @trait_ids) || '0';
+    
+    # Step 1: Get stocks (plots) from this trial via project
+    my $sth_stocks = $dbh->prepare(q{
+        SELECT DISTINCT s.stock_id, s.uniquename as plot_name
+        FROM stock s
+        JOIN nd_experiment_stock nes ON s.stock_id = nes.stock_id
+        JOIN nd_experiment_project nep ON nes.nd_experiment_id = nep.nd_experiment_id
+        WHERE nep.project_id = ?
+        ORDER BY s.uniquename
+    });
+    $sth_stocks->execute($trial_id);
+    
+    my %stock_ids;
+    while (my $row = $sth_stocks->fetchrow_hashref) {
+        $stock_ids{$row->{stock_id}} = $row->{plot_name};
+    }
+    
+    return $c->stash->{rest} = { error => "No stocks in trial" } unless %stock_ids;
+    
+    my $stock_list = join(',', keys %stock_ids);
+    
+    # Step 2: Get phenotypes for these stocks via nd_experiment_stock -> nd_experiment_phenotype
+    my $sql = qq{
+        SELECT s.stock_id, s.uniquename as plot_name,
+               p.observable_id as trait_id, p.value as trait_value, p.collect_date
+        FROM stock s
+        JOIN nd_experiment_stock nes ON s.stock_id = nes.stock_id
+        JOIN nd_experiment_phenotype nep ON nes.nd_experiment_id = nep.nd_experiment_id
+        JOIN phenotype p ON nep.phenotype_id = p.phenotype_id
+        WHERE s.stock_id IN ($stock_list)
+        AND p.observable_id IN ($trait_list)
+    };
+    my $pheno_rows_ref = $dbh->selectall_arrayref($sql, { Slice => {} });
+    
+    # Initialize all plots with defaults
+    my %plot_data;
+    foreach my $sid (keys %stock_ids) {
+        $plot_data{$sid} = {
+            stock_id => $sid,
+            name => $stock_ids{$sid},
+            has_emergence => 0,
+            has_flowering => 0,
+            has_maturity => 0,
+            emergence_value => undef,
+            flowering_value => undef,
+            maturity_value => undef,
+        };
+    }
+    
+    # Process phenotype data for plots
+    my $pheno_rows = scalar @$pheno_rows_ref;
+    foreach my $row (@$pheno_rows_ref) {
+        my $sid = $row->{stock_id};
+        next unless $plot_data{$sid};
+        
+        my $tid = $row->{trait_id};
+        next unless $tid;
+        
+        my $emerg_ids = ref($traits->{emergence}) eq 'ARRAY' ? $traits->{emergence} : [$traits->{emergence}];
+        my $flower_ids = ref($traits->{flowering}) eq 'ARRAY' ? $traits->{flowering} : [$traits->{flowering}];
+        my $matur_ids = ref($traits->{maturity}) eq 'ARRAY' ? $traits->{maturity} : [$traits->{maturity}];
+        
+        if (grep { $_ == $tid } @$emerg_ids) {
+            $plot_data{$sid}{has_emergence} = 1;
+            $plot_data{$sid}{emergence_value} = $row->{trait_value};
+        } elsif (grep { $_ == $tid } @$flower_ids) {
+            $plot_data{$sid}{has_flowering} = 1;
+            $plot_data{$sid}{flowering_value} = $row->{trait_value};
+        } elsif (grep { $_ == $tid } @$matur_ids) {
+            $plot_data{$sid}{has_maturity} = 1;
+            $plot_data{$sid}{maturity_value} = $row->{trait_value};
+        }
+    }
+    
+    # Group by germplasm (extract from plot name: lub-trial-repX-GERMPLASM_N)
+    my %germplasm_data;
+    foreach my $sid (keys %plot_data) {
+        my $plot_name = $plot_data{$sid}{name};
+        my $germplasm;
+        
+        # Extract germplasm: try pattern "repX-NAME_N" or just use plot name
+        if ($plot_name =~ /rep\d+-([^_]+)/) {
+            $germplasm = $1;
+        } else {
+            $germplasm = $plot_name;
+        }
+        
+        if (!$germplasm_data{$germplasm}) {
+            $germplasm_data{$germplasm} = {
+                name => $germplasm,
+                plot_count => 0,
+                plots_with_emergence => 0,
+                plots_with_flowering => 0,
+                plots_with_maturity => 0,
+                avg_emergence => 0,
+                avg_flowering => 0,
+                avg_maturity => 0,
+                emergence_values => [],
+                flowering_values => [],
+                maturity_values => [],
+                plot_ids => [],
+            };
+        }
+        
+        my $g = $germplasm_data{$germplasm};
+        $g->{plot_count}++;
+        push @{$g->{plot_ids}}, $sid;
+        
+        if ($plot_data{$sid}{has_emergence}) {
+            $g->{plots_with_emergence}++;
+            push @{$g->{emergence_values}}, $plot_data{$sid}{emergence_value};
+        }
+        if ($plot_data{$sid}{has_flowering}) {
+            $g->{plots_with_flowering}++;
+            push @{$g->{flowering_values}}, $plot_data{$sid}{flowering_value};
+        }
+        if ($plot_data{$sid}{has_maturity}) {
+            $g->{plots_with_maturity}++;
+            push @{$g->{maturity_values}}, $plot_data{$sid}{maturity_value};
+        }
+    }
+    
+    # Calculate averages and determine validation status
+    my @accessions;
+    foreach my $germ (sort keys %germplasm_data) {
+        my $g = $germplasm_data{$germ};
+        
+        # Calculate averages
+        if (@{$g->{emergence_values}}) {
+            my $sum = 0; $sum += $_ for @{$g->{emergence_values}};
+            $g->{avg_emergence} = sprintf("%.1f", $sum / scalar(@{$g->{emergence_values}}));
+        }
+        if (@{$g->{flowering_values}}) {
+            my $sum = 0; $sum += $_ for @{$g->{flowering_values}};
+            $g->{avg_flowering} = sprintf("%.1f", $sum / scalar(@{$g->{flowering_values}}));
+        }
+        if (@{$g->{maturity_values}}) {
+            my $sum = 0; $sum += $_ for @{$g->{maturity_values}};
+            $g->{avg_maturity} = sprintf("%.1f", $sum / scalar(@{$g->{maturity_values}}));
+        }
+        
+        # Determine what's missing
+        my @missing;
+        push @missing, 'emergence' unless $g->{plots_with_emergence};
+        push @missing, 'flowering' unless $g->{plots_with_flowering};
+        push @missing, 'maturity' unless $g->{plots_with_maturity};
+        
+        # Validation status: ready if has at least maturity OR flowering
+        my $is_ready = ($g->{plots_with_maturity} > 0 || $g->{plots_with_flowering} > 0) ? 1 : 0;
+        
+        push @accessions, {
+            name => $germ,
+            plot_count => $g->{plot_count},
+            plot_ids => $g->{plot_ids},
+            has_emergence => $g->{plots_with_emergence} > 0 ? 1 : 0,
+            has_flowering => $g->{plots_with_flowering} > 0 ? 1 : 0,
+            has_maturity => $g->{plots_with_maturity} > 0 ? 1 : 0,
+            emergence_value => $g->{avg_emergence} || undef,
+            flowering_value => $g->{avg_flowering} || undef,
+            maturity_value => $g->{avg_maturity} || undef,
+            missing => \@missing,
+            is_ready => $is_ready,
+        };
+    }
+    
+    # Count ready/not ready
+    my $ready_count = grep { $_->{is_ready} } @accessions;
+    my $not_ready_count = scalar(@accessions) - $ready_count;
+    
+    $c->stash->{rest} = {
+        trial => {
+            id => $trial_id,
+            planting_date => $planting,
+            harvest_date => $harvest,
+            location_id => $location_id,
+        },
+        crop => $detected_cv,
+        traits => $traits,
+        summary => {
+            total_germplasm => scalar(@accessions),
+            ready => $ready_count,
+            not_ready => $not_ready_count,
+            total_plots => scalar(keys %stock_ids),
+        },
+        accessions => \@accessions
+    };
+}
+
+# ============================================================================
+# GET PHENOLOGY TRAITS (Dynamic Ontology Loading)
+# ============================================================================
+
+sub get_phenology_traits : Path('/ajax/phenology/traits') Args(0) ActionClass('REST') { }
+sub get_phenology_traits_GET {
+    my ($self, $c) = @_;
+    
+    my $dbh = $c->dbc->dbh;
+    my $crop = $c->req->param('crop') || 'maize';
+    
+    # Search for relevant traits by keyword patterns
+    my $sth = $dbh->prepare(q{
+        SELECT cv.cvterm_id, cv.name, db.name as ontology
+        FROM cvterm cv
+        JOIN dbxref dx ON cv.dbxref_id = dx.dbxref_id
+        JOIN db ON dx.db_id = db.db_id
+        WHERE (
+            LOWER(cv.name) LIKE '%emergence%' OR
+            LOWER(cv.name) LIKE '%seedling%' OR
+            LOWER(cv.name) LIKE '%flowering%' OR
+            LOWER(cv.name) LIKE '%silking%' OR
+            LOWER(cv.name) LIKE '%anthesis%' OR
+            LOWER(cv.name) LIKE '%maturity%' OR
+            LOWER(cv.name) LIKE '%black layer%'
+        )
+        AND db.name IN ('CO_322', 'CO_336', 'CO_359', 'CO_317', 'maize_trait', 'soybean_trait', 'sunflower_trait', 'cotton_trait')
+        ORDER BY cv.name
+        LIMIT 100
+    });
+    $sth->execute();
+    
+    my @emergence; my @flowering; my @maturity;
+    while (my $row = $sth->fetchrow_hashref) {
+        my $lower = lc($row->{name});
+        my $trait = { id => $row->{cvterm_id}, name => $row->{name}, ontology => $row->{ontology} };
+        
+        if ($lower =~ /emergence|seedling/) {
+            push @emergence, $trait;
+        } elsif ($lower =~ /flowering|silking|anthesis/) {
+            push @flowering, $trait;
+        } elsif ($lower =~ /maturity|black layer/) {
+            push @maturity, $trait;
+        }
+    }
+    
+    # Get defaults for current crop
+    my %defaults = (
+        maize => { emergence => 97939, flowering => 81054, maturity => 80767 },
+        soybean => { emergence => 97940, flowering => 81093, maturity => 81098 },
+        sunflower => { emergence => 81733, flowering => 81729, maturity => 81722 },
+        cotton => { emergence => 81596, flowering => 81563, maturity => 81535 },
+    );
+    
+    $c->stash->{rest} = {
+        traits => {
+            emergence => \@emergence,
+            flowering => \@flowering,
+            maturity => \@maturity,
+        },
+        defaults => $defaults{$crop} || $defaults{maize},
+        crop => $crop,
+    };
+}
+
+# ============================================================================
 # STORE GDD/CHU PHENOTYPES (Maturity Calculator)
 # ============================================================================
 
@@ -728,14 +1181,97 @@ sub store_gdd_phenotypes_POST {
     
     my $trial_id = $c->req->param('trial_id');
     my $accession_ids_json = $c->req->param('accession_ids');
-    my $gdd_value = $c->req->param('gdd');
-    my $chu_value = $c->req->param('chu');
-    my $start_date = $c->req->param('start_date');
-    my $end_date = $c->req->param('end_date');
-    my $location_id = $c->req->param('location_id');
+    my $crop = $c->req->param('crop') || 'maize_trait';
+    # User-selectable maturity trait - if provided, use it; otherwise use defaults
+    my $user_maturity_trait_id = $c->req->param('maturity_trait_id');
+    my $user_emergence_trait_id = $c->req->param('emergence_trait_id');
+    my $use_planting_fallback = $c->req->param('use_planting_fallback') || 0;
+    my $fallback_emergence_days = $c->req->param('fallback_emergence_days') || 7;
+    # GDD/CHU from frontend are now optional - we calculate per-plot
+    my $fallback_gdd = $c->req->param('gdd') || 0;
+    my $fallback_chu = $c->req->param('chu') || 0;
     
-    unless ($trial_id && $accession_ids_json && $gdd_value && $chu_value) {
+    unless ($trial_id && $accession_ids_json) {
         $c->stash->{rest} = { error => "Missing required parameters" };
+        return;
+    }
+    
+    # Crop-specific trait IDs for OUTPUT (GDD/CHU phenotypes)
+    my %crop_gdd_traits = (
+        'maize_trait' => 97927,
+        'CO_336'      => 97932,
+        'CO_359'      => 97935,
+        'CO_358'      => 97942,
+    );
+    my %crop_chu_traits = (
+        'maize_trait' => 97929,
+        'CO_336'      => 97933,
+        'CO_359'      => 97936,
+        'CO_358'      => 97943,
+    );
+    
+    my $gdd_trait_id = $crop_gdd_traits{$crop};
+    my $chu_trait_id = $crop_chu_traits{$crop};
+    
+    # Default maturity traits (fallback if user doesn't specify)
+    my %default_maturity_day = (
+        'maize_trait' => 80767,
+        'CO_336'      => 80767,
+        'CO_359'      => 80767,
+        'CO_358'      => 80767,
+    );
+    my %default_maturity_date = (
+        'maize_trait' => 80820,
+        'CO_336'      => 80820,
+        'CO_359'      => 80820,
+        'CO_358'      => 80820,
+    );
+    
+    # Default emergence traits
+    my %default_emergence = (
+        'maize_trait' => 97939,  # Seedling emergence - Date (yymmdd)
+        'CO_336'      => 97941,
+        'CO_359'      => 97939,
+        'CO_358'      => 97939,
+    );
+    
+    my $maturity_day_trait_id;
+    my $maturity_date_trait_id;
+    my $emergence_trait_id;
+    my $user_trait_format = 'unknown';
+    
+    if ($user_maturity_trait_id) {
+        # User selected specific trait - determine its format
+        my $dbh = $c->dbc->dbh();
+        my $sth = $dbh->prepare("SELECT name FROM cvterm WHERE cvterm_id = ?");
+        $sth->execute($user_maturity_trait_id);
+        my ($trait_name) = $sth->fetchrow_array();
+        
+        if (!$trait_name) {
+            $c->stash->{rest} = { error => "Selected maturity trait (ID: $user_maturity_trait_id) not found in database" };
+            return;
+        }
+        
+        # User selected a specific trait - we'll use it and detect format from actual values
+        # Set it as both day and date trait - format determined later from actual data
+        $maturity_day_trait_id = $user_maturity_trait_id;
+        $maturity_date_trait_id = $user_maturity_trait_id;
+        $user_trait_format = 'auto';  # Will be determined from actual data values
+    } else {
+        # Use defaults for this crop
+        $maturity_day_trait_id = $default_maturity_day{$crop};
+        $maturity_date_trait_id = $default_maturity_date{$crop};
+    }
+    
+    # Set emergence trait
+    if ($user_emergence_trait_id) {
+        $emergence_trait_id = $user_emergence_trait_id;
+    } else {
+        $emergence_trait_id = $default_emergence{$crop};
+    }
+    
+    unless ($gdd_trait_id && $chu_trait_id) {
+        $c->stash->{rest} = { error => "Unknown crop type: $crop" };
         return;
     }
     
@@ -743,75 +1279,436 @@ sub store_gdd_phenotypes_POST {
         my $accession_ids = decode_json($accession_ids_json);
         my $dbh = $c->dbc->dbh;
         
-        # Get GDD and CHU trait IDs
-        my $sth_trait = $dbh->prepare(q{
-            SELECT cvterm_id, name FROM cvterm 
-            WHERE name IN ('Growing Degree Days', 'Crop Heat Units')
-            AND cv_id = (SELECT cv_id FROM cv WHERE name = 'maize_trait')
+        # Get trial info: planting date and location
+        my $sth_trial = $dbh->prepare(q{
+            SELECT 
+                projectprop_planting.value as planting_date,
+                nd_geolocation.nd_geolocation_id as location_id
+            FROM project
+            LEFT JOIN projectprop projectprop_planting 
+                ON project.project_id = projectprop_planting.project_id 
+                AND projectprop_planting.type_id = (SELECT cvterm_id FROM cvterm WHERE name = 'project_planting_date')
+            LEFT JOIN nd_experiment_project ON project.project_id = nd_experiment_project.project_id
+            LEFT JOIN nd_experiment ON nd_experiment_project.nd_experiment_id = nd_experiment.nd_experiment_id
+            LEFT JOIN nd_geolocation ON nd_experiment.nd_geolocation_id = nd_geolocation.nd_geolocation_id
+            WHERE project.project_id = ?
+            LIMIT 1
         });
-        $sth_trait->execute();
+        $sth_trial->execute($trial_id);
+        my $trial_info = $sth_trial->fetchrow_hashref();
         
-        my %trait_ids;
-        while (my $row = $sth_trait->fetchrow_hashref) {
-            $trait_ids{$row->{name}} = $row->{cvterm_id};
+        my $planting_date_raw = $trial_info->{planting_date};
+        my $location_id = $trial_info->{location_id};
+        
+        # Parse planting date from various formats
+        # Could be: simple date, timestamp, or JSON array like {"2025-04-15T00:00:00",...}
+        my $planting_date;
+        if ($planting_date_raw) {
+            # Extract first date from JSON-like array format
+            if ($planting_date_raw =~ /\{?"?(\d{4}-\d{2}-\d{2})/) {
+                $planting_date = $1;
+            } elsif ($planting_date_raw =~ /^(\d{4}-\d{2}-\d{2})/) {
+                $planting_date = $1;
+            }
         }
         
-        my $gdd_trait_id = $trait_ids{'Growing Degree Days'};
-        my $chu_trait_id = $trait_ids{'Crop Heat Units'};
-        
-        unless ($gdd_trait_id && $chu_trait_id) {
-            $c->stash->{rest} = { error => "GDD/CHU traits not found in maize ontology" };
+        unless ($planting_date && $location_id) {
+            $c->stash->{rest} = { error => "Trial missing planting date (got: $planting_date_raw) or location" };
             return;
         }
         
-        # Get experiment/plot IDs for the accessions in this trial
+        # Get the PHENOTYPING experiment for each stock 
         my $placeholders = join(',', ('?') x scalar(@$accession_ids));
         my $sth_plots = $dbh->prepare(qq{
             SELECT s.stock_id, nde.nd_experiment_id
             FROM stock s
             JOIN nd_experiment_stock nes ON s.stock_id = nes.stock_id
             JOIN nd_experiment nde ON nes.nd_experiment_id = nde.nd_experiment_id
-            JOIN nd_experiment_project ndep ON nde.nd_experiment_id = ndep.nd_experiment_id
-            WHERE ndep.project_id = ?
+            JOIN cvterm c ON nde.type_id = c.cvterm_id
+            WHERE c.name = 'phenotyping_experiment'
             AND s.stock_id IN ($placeholders)
         });
-        $sth_plots->execute($trial_id, @$accession_ids);
+        $sth_plots->execute(@$accession_ids);
         
         my %stock_experiments;
         while (my $row = $sth_plots->fetchrow_hashref) {
             $stock_experiments{$row->{stock_id}} = $row->{nd_experiment_id};
         }
         
-        # Insert phenotypes
-        my $sth_insert = $dbh->prepare(q{
-            INSERT INTO phenotype (observable_id, value, nd_experiment_id, cvalue_id)
-            VALUES (?, ?, ?, ?)
+        # Get maturity values and auto-detect format from actual data values
+        # - If value is numeric and < 200 -> treat as days
+        # - If value matches date pattern (yyyymmdd, yymmdd, yyyy-mm-dd) -> convert to days
+        my $sth_maturity = $dbh->prepare(qq{
+            SELECT 
+                nes.stock_id,
+                p.value as maturity_value
+            FROM phenotype p
+            JOIN nd_experiment_phenotype nep ON p.phenotype_id = nep.phenotype_id
+            JOIN nd_experiment_stock nes ON nep.nd_experiment_id = nes.nd_experiment_id
+            WHERE nes.stock_id IN ($placeholders)
+            AND p.cvalue_id = ?
+        });
+        $sth_maturity->execute(@$accession_ids, $maturity_day_trait_id);
+        
+        # Parse planting date for date calculations
+        use Time::Piece;
+        my $planting_tp = Time::Piece->strptime($planting_date, '%Y-%m-%d');
+        
+        my %plot_maturity_days;
+        my @format_errors;
+        
+        while (my $row = $sth_maturity->fetchrow_hashref) {
+            my $val = $row->{maturity_value};
+            next unless defined $val && $val ne '';
+            
+            my $stock_id = $row->{stock_id};
+            $val =~ s/^\s+|\s+$//g;  # Trim
+            
+            # Auto-detect format from value
+            if ($val =~ /^(\d+)$/ && $1 < 200) {
+                # Numeric value < 200 = treat as days after planting
+                $plot_maturity_days{$stock_id} = int($1);
+            } elsif ($val =~ /^(\d{4})(\d{2})(\d{2})$/) {
+                # yyyymmdd format
+                my ($y, $m, $d) = ($1, $2, $3);
+                my $mat_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+                my $mat_tp = Time::Piece->strptime($mat_date_str, '%Y-%m-%d');
+                my $diff_days = int(($mat_tp - $planting_tp) / (24 * 60 * 60));
+                $plot_maturity_days{$stock_id} = $diff_days if $diff_days > 0;
+            } elsif ($val =~ /^(\d{2})(\d{2})(\d{2})$/) {
+                # yymmdd format
+                my ($y, $m, $d) = ("20$1", $2, $3);
+                my $mat_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+                my $mat_tp = Time::Piece->strptime($mat_date_str, '%Y-%m-%d');
+                my $diff_days = int(($mat_tp - $planting_tp) / (24 * 60 * 60));
+                $plot_maturity_days{$stock_id} = $diff_days if $diff_days > 0;
+            } elsif ($val =~ /^(\d{4})-(\d{2})-(\d{2})/) {
+                # yyyy-mm-dd format
+                my ($y, $m, $d) = ($1, $2, $3);
+                my $mat_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+                my $mat_tp = Time::Piece->strptime($mat_date_str, '%Y-%m-%d');
+                my $diff_days = int(($mat_tp - $planting_tp) / (24 * 60 * 60));
+                $plot_maturity_days{$stock_id} = $diff_days if $diff_days > 0;
+            } else {
+                # Unknown format - skip but track for error reporting
+                push @format_errors, { stock_id => $stock_id, value => $val };
+            }
+        }
+        
+        # If we have format errors and no successful conversions, report error
+        if (@format_errors && scalar(keys %plot_maturity_days) == 0) {
+            my $sample = $format_errors[0];
+            $c->stash->{rest} = { 
+                error => "Unrecognized data format: '$sample->{value}'. Expected either days count (numeric < 200) or date format (yyyymmdd, yymmdd, yyyy-mm-dd).",
+                sample_value => $sample->{value},
+                stock_id => $sample->{stock_id}
+            };
+            return;
+        }
+        
+        # Get emergence values for each plot (days after planting when emergence occurred)
+        my %plot_emergence_days;
+        if ($emergence_trait_id) {
+            my $sth_emergence = $dbh->prepare(qq{
+                SELECT nes.stock_id, p.value as emergence_value
+                FROM phenotype p
+                JOIN nd_experiment_phenotype nep ON p.phenotype_id = nep.phenotype_id
+                JOIN nd_experiment_stock nes ON nep.nd_experiment_id = nes.nd_experiment_id
+                WHERE nes.stock_id IN ($placeholders)
+                AND p.cvalue_id = ?
+            });
+            $sth_emergence->execute(@$accession_ids, $emergence_trait_id);
+            
+            while (my $row = $sth_emergence->fetchrow_hashref) {
+                my $val = $row->{emergence_value};
+                next unless defined $val && $val ne '';
+                
+                my $stock_id = $row->{stock_id};
+                $val =~ s/^\s+|\s+$//g;  # Trim
+                
+                # Auto-detect format from value (same logic as maturity)
+                if ($val =~ /^(\d+)$/ && $1 < 200) {
+                    # Numeric value < 200 = treat as days after planting
+                    $plot_emergence_days{$stock_id} = int($1);
+                } elsif ($val =~ /^(\d{4})(\d{2})(\d{2})$/) {
+                    # yyyymmdd format
+                    my ($y, $m, $d) = ($1, $2, $3);
+                    my $em_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+                    my $em_tp = Time::Piece->strptime($em_date_str, '%Y-%m-%d');
+                    my $diff_days = int(($em_tp - $planting_tp) / (24 * 60 * 60));
+                    $plot_emergence_days{$stock_id} = $diff_days if $diff_days > 0;
+                } elsif ($val =~ /^(\d{2})(\d{2})(\d{2})$/) {
+                    # yymmdd format
+                    my ($y, $m, $d) = ("20$1", $2, $3);
+                    my $em_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+                    my $em_tp = Time::Piece->strptime($em_date_str, '%Y-%m-%d');
+                    my $diff_days = int(($em_tp - $planting_tp) / (24 * 60 * 60));
+                    $plot_emergence_days{$stock_id} = $diff_days if $diff_days > 0;
+                } elsif ($val =~ /^(\d{4})-(\d{2})-(\d{2})/) {
+                    # yyyy-mm-dd format
+                    my ($y, $m, $d) = ($1, $2, $3);
+                    my $em_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+                    my $em_tp = Time::Piece->strptime($em_date_str, '%Y-%m-%d');
+                    my $diff_days = int(($em_tp - $planting_tp) / (24 * 60 * 60));
+                    $plot_emergence_days{$stock_id} = $diff_days if $diff_days > 0;
+                }
+                # Unknown format values are simply skipped
+            }
+        }
+        
+        # Get location lat/lon
+        my $sth_loc = $dbh->prepare(q{
+            SELECT latitude, longitude FROM nd_geolocation WHERE nd_geolocation_id = ?
+        });
+        $sth_loc->execute($location_id);
+        my ($lat, $lon) = $sth_loc->fetchrow_array();
+        
+        unless ($lat && $lon) {
+            $c->stash->{rest} = { error => "Location has no coordinates" };
+            return;
+        }
+        
+        # Get weather data for entire possible period (planting to furthest maturity)
+        my @all_maturity_days = values %plot_maturity_days;
+        my $max_days = @all_maturity_days ? (sort { $b <=> $a } @all_maturity_days)[0] : 100;
+        
+        # Calculate end date as planting + max_days
+        my $end_tp = $planting_tp + ($max_days * 24 * 60 * 60);
+        my $full_end_date = $end_tp->strftime('%Y-%m-%d');
+        
+        # Fetch weather data once for full period
+        my @weather_data = @{$self->_get_cached_weather($c, $location_id, $planting_date, $full_end_date)};
+        
+        # Build day index for quick lookup
+        my %weather_by_day;
+        my $day_num = 0;
+        foreach my $day (@weather_data) {
+            $day_num++;
+            $weather_by_day{$day_num} = $day;
+        }
+        
+        # Prepared statements
+        # Check for existing phenotype for this stock+trait
+        my $sth_check_existing = $dbh->prepare(q{
+            SELECT p.phenotype_id 
+            FROM phenotype p
+            JOIN nd_experiment_phenotype nep ON p.phenotype_id = nep.phenotype_id
+            JOIN nd_experiment_stock nes ON nep.nd_experiment_id = nes.nd_experiment_id
+            WHERE nes.stock_id = ?
+            AND p.cvalue_id = ?
+            LIMIT 1
+        });
+        
+        # Update existing phenotype
+        my $sth_update_pheno = $dbh->prepare(q{
+            UPDATE phenotype 
+            SET value = ?, collect_date = ?, operator = 'GDD Calculator (updated)'
+            WHERE phenotype_id = ?
+        });
+        
+        my $sth_insert_pheno = $dbh->prepare(q{
+            INSERT INTO phenotype (uniquename, observable_id, cvalue_id, value, collect_date, operator)
+            VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING phenotype_id
+        });
+        
+        my $sth_link_exp = $dbh->prepare(q{
+            INSERT INTO nd_experiment_phenotype (nd_experiment_id, phenotype_id)
+            VALUES (?, ?)
             ON CONFLICT DO NOTHING
         });
         
         my $created = 0;
+        my @results;
+        
         foreach my $stock_id (@$accession_ids) {
             my $exp_id = $stock_experiments{$stock_id};
             next unless $exp_id;
             
-            # Insert GDD phenotype
-            $sth_insert->execute($gdd_trait_id, $gdd_value, $exp_id, undef);
-            $created++ if $sth_insert->rows > 0;
+            # Get this plot's maturity days
+            my $maturity_days = $plot_maturity_days{$stock_id};
             
-            # Insert CHU phenotype
-            $sth_insert->execute($chu_trait_id, $chu_value, $exp_id, undef);
-            $created++ if $sth_insert->rows > 0;
+            unless ($maturity_days && $maturity_days > 0) {
+                # Skip plots without maturity data
+                next;
+            }
+            
+            # Get emergence days for this plot
+            my $start_day;
+            my $emergence_days = $plot_emergence_days{$stock_id};
+            
+            if ($emergence_days && $emergence_days > 0 && $emergence_days < $maturity_days) {
+                # Use emergence as start day
+                $start_day = $emergence_days;
+            } elsif ($use_planting_fallback) {
+                # Fallback to planting date + user-specified emergence days
+                $start_day = $fallback_emergence_days;
+            } else {
+                # No emergence data and no fallback - skip this plot
+                next;
+            }
+            
+            # Calculate GDD/CHU for this specific plot (from emergence to maturity)
+            my ($plot_gdd, $plot_chu) = (0, 0);
+            my $base_temp = 10;
+            
+            for (my $day = $start_day; $day <= $maturity_days; $day++) {
+                my $weather = $weather_by_day{$day};
+                next unless $weather && defined($weather->{tmax}) && defined($weather->{tmin});
+                
+                my $tmax = $weather->{tmax} + 0;
+                my $tmin = $weather->{tmin} + 0;
+                
+                # GDD calculation
+                my $tavg = ($tmax + $tmin) / 2;
+                my $gdd = $tavg > $base_temp ? $tavg - $base_temp : 0;
+                $plot_gdd += $gdd;
+                
+                # CHU calculation (Ontario method)
+                my $chu_max = $tmax > 10 ? 3.33 * ($tmax - 10) - 0.084 * (($tmax - 10) ** 2) : 0;
+                my $chu_min = $tmin > 4.4 ? 1.8 * ($tmin - 4.4) : 0;
+                my $chu_day = ($chu_max + $chu_min) / 2;
+                $chu_day = 0 if $chu_day < 0;
+                $plot_chu += $chu_day;
+            }
+            
+            # Calculate collect_date for this plot
+            my $collect_tp = $planting_tp + ($maturity_days * 24 * 60 * 60);
+            my $collect_date = $collect_tp->strftime('%Y-%m-%d');
+            
+            my $timestamp = time();
+            
+            # Insert or Update GDD phenotype
+            my $gdd_val = sprintf("%.1f", $plot_gdd);
+            
+            # Check if GDD phenotype already exists for this stock
+            $sth_check_existing->execute($stock_id, $gdd_trait_id);
+            my ($existing_gdd_id) = $sth_check_existing->fetchrow_array();
+            
+            if ($existing_gdd_id) {
+                # Update existing
+                $sth_update_pheno->execute($gdd_val, $collect_date, $existing_gdd_id);
+                $created++;
+            } else {
+                # Insert new
+                my $gdd_uniquename = "gdd_stock_${stock_id}_trial_${trial_id}_${timestamp}";
+                $sth_insert_pheno->execute($gdd_uniquename, $gdd_trait_id, $gdd_trait_id, $gdd_val, $collect_date, 'GDD Calculator');
+                my ($gdd_pheno_id) = $sth_insert_pheno->fetchrow_array();
+                if ($gdd_pheno_id) {
+                    $sth_link_exp->execute($exp_id, $gdd_pheno_id);
+                    $created++ if $sth_link_exp->rows > 0;
+                }
+            }
+            
+            # Insert or Update CHU phenotype
+            my $chu_val = sprintf("%.1f", $plot_chu);
+            
+            # Check if CHU phenotype already exists for this stock
+            $sth_check_existing->execute($stock_id, $chu_trait_id);
+            my ($existing_chu_id) = $sth_check_existing->fetchrow_array();
+            
+            if ($existing_chu_id) {
+                # Update existing
+                $sth_update_pheno->execute($chu_val, $collect_date, $existing_chu_id);
+                $created++;
+            } else {
+                # Insert new
+                my $chu_uniquename = "chu_stock_${stock_id}_trial_${trial_id}_${timestamp}";
+                $sth_insert_pheno->execute($chu_uniquename, $chu_trait_id, $chu_trait_id, $chu_val, $collect_date, 'GDD Calculator');
+                my ($chu_pheno_id) = $sth_insert_pheno->fetchrow_array();
+                if ($chu_pheno_id) {
+                    $sth_link_exp->execute($exp_id, $chu_pheno_id);
+                    $created++ if $sth_link_exp->rows > 0;
+                }
+            }
+            
+            push @results, {
+                stock_id => $stock_id,
+                maturity_days => $maturity_days,
+                gdd => $gdd_val,
+                chu => $chu_val,
+            };
         }
         
         $c->stash->{rest} = {
             success => 1,
             created => $created,
-            message => "Created $created GDD/CHU phenotypes"
+            crop => $crop,
+            gdd_trait_id => $gdd_trait_id,
+            chu_trait_id => $chu_trait_id,
+            message => "Created $created GDD/CHU phenotypes for $crop (per-plot calculation)",
+            results => \@results
         };
         
     } catch {
         $c->stash->{rest} = { error => "Failed to store phenotypes: $_" };
     };
+}
+
+# ============================================================================
+# HELPER SUBROUTINES
+# ============================================================================
+
+# Parse a maturity value and return days from planting
+# Arguments: $value, $planting_date (YYYY-MM-DD)
+# Returns: (days, error_message) - days is undef on error
+sub _parse_maturity_value {
+    my ($value, $planting_date) = @_;
+    
+    return (undef, "Empty value") unless defined $value && $value ne '';
+    
+    $value =~ s/^\s+|\s+$//g;  # Trim whitespace
+    
+    # Numeric value < 200 = treat as days after planting
+    if ($value =~ /^(\d+)$/ && $1 < 200) {
+        return (int($1), undef);
+    }
+    
+    # Date formats require planting_date
+    unless ($planting_date) {
+        return (undef, "Planting date required for date conversion");
+    }
+    
+    require Time::Piece;
+    my $planting_tp = Time::Piece->strptime($planting_date, '%Y-%m-%d');
+    
+    my ($y, $m, $d);
+    
+    # yyyymmdd format
+    if ($value =~ /^(\d{4})(\d{2})(\d{2})$/) {
+        ($y, $m, $d) = ($1, $2, $3);
+    }
+    # yymmdd format  
+    elsif ($value =~ /^(\d{2})(\d{2})(\d{2})$/) {
+        ($y, $m, $d) = ("20$1", $2, $3);
+    }
+    # yyyy-mm-dd format
+    elsif ($value =~ /^(\d{4})-(\d{2})-(\d{2})/) {
+        ($y, $m, $d) = ($1, $2, $3);
+    }
+    else {
+        return (undef, "Unrecognized format: '$value'. Expected days (<200) or date (yyyymmdd/yymmdd/yyyy-mm-dd)");
+    }
+    
+    my $mat_date_str = sprintf("%04d-%02d-%02d", $y, $m, $d);
+    my $mat_tp = Time::Piece->strptime($mat_date_str, '%Y-%m-%d');
+    my $diff_days = int(($mat_tp - $planting_tp) / (24 * 60 * 60));
+    
+    return ($diff_days > 0 ? $diff_days : undef, $diff_days <= 0 ? "Maturity date before planting" : undef);
+}
+
+# Detect format from trait name for UI badges
+# Returns: 'day', 'date', or 'unknown'
+sub _detect_trait_format_from_name {
+    my ($trait_name) = @_;
+    
+    if ($trait_name =~ /-(?: |)day(?:s)?$/i || $trait_name =~ /time - day/i) {
+        return 'day';
+    }
+    elsif ($trait_name =~ /yyyymmdd/i || $trait_name =~ /date/i) {
+        return 'date';
+    }
+    return 'unknown';
 }
 
 1;
